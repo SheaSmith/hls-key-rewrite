@@ -7,6 +7,15 @@ import re
 
 app = Flask(__name__)
 
+@app.route("/key")
+def serve_key():
+    key_hex = request.args.get("key")
+    if not key_hex:
+        return "missing key", 400
+
+    key_bytes = bytes.fromhex(key_hex)
+    return Response(key_bytes, content_type="application/octet-stream")
+
 @app.route("/playlist.m3u8")
 def playlist():
     hls_url = request.args.get("url")
@@ -34,10 +43,12 @@ def playlist():
     # Parse playlist with m3u8 for further processing
     playlist = m3u8.loads(playlist_text, uri=hls_url)
 
+    key_uri = f"http://{request.host}/key?key={key_hex}"
+
     # Replace all EXT-X-KEY tags with data URI
     for key_tag in playlist.keys:
         if key_tag:
-            key_tag.uri = data_uri
+            key_tag.uri = key_uri
             key_tag.method = "SAMPLE-AES-CBC"  # change if CTR
             key_tag.keyformat = "identity"
 
