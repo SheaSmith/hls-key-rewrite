@@ -1,5 +1,6 @@
 import requests
 import m3u8
+from m3u8.model import SessionKey
 from flask import Flask, Response, request
 from urllib.parse import urljoin, quote
 import base64
@@ -44,6 +45,18 @@ def playlist():
     playlist = m3u8.loads(playlist_text, uri=hls_url)
 
     key_uri = f"http://{request.host}/key?key={key_hex}"
+
+    # Replace any EXT-X-SESSION-KEY entries in master with our local key endpoint
+    if hasattr(playlist, "session_keys") and playlist.session_keys is not None:
+        # Overwrite with a single identity key that points to our /key endpoint
+        playlist.session_keys = [
+            SessionKey(
+                method="SAMPLE-AES-CBC",  # adjust if upstream uses CTR
+                uri=key_uri,
+                keyformat="identity",
+                base_uri=hls_url,
+            )
+        ]
 
     # Replace all EXT-X-KEY tags with data URI
     for key_tag in playlist.keys:
