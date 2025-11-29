@@ -51,7 +51,7 @@ def playlist():
         # Overwrite with a single identity key that points to our /key endpoint
         playlist.session_keys = [
             SessionKey(
-                method="SAMPLE-AES-CTR",  # adjust if upstream uses CTR
+                method="SAMPLE-AES",  # adjust if upstream uses CTR
                 uri=key_uri,
                 keyformat="identity",
                 base_uri=hls_url,
@@ -62,7 +62,7 @@ def playlist():
     for key_tag in playlist.keys:
         if key_tag:
             key_tag.uri = key_uri
-            key_tag.method = "SAMPLE-AES-CTR"  # change if CTR
+            key_tag.method = "SAMPLE-AES"  # change if CTR
             key_tag.keyformat = "identity"
 
     # Master playlist: rewrite variant URIs and EXT-X-MEDIA
