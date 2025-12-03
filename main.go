@@ -19,7 +19,7 @@ func main() {
 		port = "8080"
 	}
 
-	http.HandleFunc("/proxy", proxyHandler)
+	http.HandleFunc("/playlist.m3u8", proxyHandler)
 
 	log.Printf("Starting HLS Proxy on :%s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
@@ -152,7 +152,7 @@ func processMasterPlaylist(w http.ResponseWriter, lines []string, hexKey, baseUR
 	if bestVariant != "" {
 		fmt.Fprintln(w, bestVariant)
 		absoluteURL := resolveURL(baseURL, bestVariantURI)
-		proxyURL := fmt.Sprintf("/proxy?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
+		proxyURL := fmt.Sprintf("/playlist.m3u8?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
 		fmt.Fprintln(w, proxyURL)
 	}
 }
@@ -253,7 +253,7 @@ func rewriteURIAttribute(line, hexKey, baseURL string) string {
 	absoluteURL := resolveURL(baseURL, originalURI)
 	
 	// It's a playlist in a master playlist, so we proxy it.
-	proxyURL := fmt.Sprintf("/proxy?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
+	proxyURL := fmt.Sprintf("/playlist.m3u8?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
 
 	return line[:start] + proxyURL + line[end:]
 }
