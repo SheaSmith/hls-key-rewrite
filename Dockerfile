@@ -1,20 +1,22 @@
-# Use official Python 3.11 image
-FROM python:3.11-slim
+FROM golang:1.23-alpine AS builder
 
-# Set working directory
 WORKDIR /app
 
-# Copy requirements
-COPY requirements.txt .
+COPY go.mod ./
+# COPY go.sum ./ # No dependencies yet, so go.sum might not exist or be needed yet.
 
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN go mod download
 
-# Copy app code
-COPY main.py .
+COPY *.go ./
 
-# Expose port
+RUN CGO_ENABLED=0 GOOS=linux go build -o /hls-proxy
+
+FROM alpine:latest
+
+WORKDIR /
+
+COPY --from=builder /hls-proxy /hls-proxy
+
 EXPOSE 8080
 
-# Run Flask app
-CMD ["python", "main.py"]
+ENTRYPOINT ["/hls-proxy"]
