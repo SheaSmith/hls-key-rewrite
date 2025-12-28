@@ -21,7 +21,7 @@ func main() {
 		port = "8080"
 	}
 
-	http.HandleFunc("/proxy", proxyHandler)
+	http.HandleFunc("/playlist.m3u8", proxyHandler)
 	http.HandleFunc("/decrypt", decryptHandler)
 	http.HandleFunc("/key.ts", keyHandler)
 
