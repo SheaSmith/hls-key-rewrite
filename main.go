@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 )
@@ -19,7 +21,9 @@ func main() {
 		port = "8080"
 	}
 
-	http.HandleFunc("/playlist.m3u8", proxyHandler)
+	http.HandleFunc("/proxy", proxyHandler)
+	http.HandleFunc("/decrypt", decryptHandler)
+	http.HandleFunc("/key.ts", keyHandler)
 
 	log.Printf("Starting HLS Proxy on :%s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
@@ -30,6 +34,7 @@ func main() {
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	targetURL := r.URL.Query().Get("url")
 	hexKey := r.URL.Query().Get("key")
+	experimental := r.URL.Query().Get("experimental") == "true"
 
 	if targetURL == "" || hexKey == "" {
 		http.Error(w, "Missing 'url' or 'key' query parameters", http.StatusBadRequest)
@@ -75,7 +80,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	scanner := bufio.NewScanner(resp.Body)
 	isMaster := false
-	
+
 	// Buffer output to determine type and process
 	var lines []string
 	for scanner.Scan() {
@@ -92,13 +97,13 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isMaster {
-		processMasterPlaylist(w, lines, hexKey, baseURL)
+		processMasterPlaylist(w, lines, hexKey, baseURL, experimental)
 	} else {
-		processMediaPlaylist(w, lines, base64Key, baseURL)
+		processMediaPlaylist(w, lines, base64Key, hexKey, baseURL, experimental)
 	}
 }
 
-func processMasterPlaylist(w http.ResponseWriter, lines []string, hexKey, baseURL string) {
+func processMasterPlaylist(w http.ResponseWriter, lines []string, hexKey, baseURL string, experimental bool) {
 	var bestVariant string
 	var bestVariantURI string
 	var maxBandwidth int
@@ -136,7 +141,7 @@ func processMasterPlaylist(w http.ResponseWriter, lines []string, hexKey, baseUR
 		if strings.HasPrefix(trimmed, "#") {
 			// Check for URI attribute in tags like #EXT-X-MEDIA
 			if strings.Contains(trimmed, "URI=\"") {
-				line = rewriteURIAttribute(line, hexKey, baseURL)
+				line = rewriteURIAttribute(line, hexKey, baseURL, experimental)
 			}
 			fmt.Fprintln(w, line)
 		} else if len(trimmed) > 0 {
@@ -152,12 +157,15 @@ func processMasterPlaylist(w http.ResponseWriter, lines []string, hexKey, baseUR
 	if bestVariant != "" {
 		fmt.Fprintln(w, bestVariant)
 		absoluteURL := resolveURL(baseURL, bestVariantURI)
-		proxyURL := fmt.Sprintf("/playlist.m3u8?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
+		proxyURL := fmt.Sprintf("/proxy?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
+		if experimental {
+			proxyURL += "&experimental=true"
+		}
 		fmt.Fprintln(w, proxyURL)
 	}
 }
 
-func processMediaPlaylist(w http.ResponseWriter, lines []string, base64Key, baseURL string) {
+func processMediaPlaylist(w http.ResponseWriter, lines []string, base64Key, hexKey, baseURL string, experimental bool) {
 	keyInserted := false
 
 	for _, line := range lines {
@@ -168,74 +176,80 @@ func processMediaPlaylist(w http.ResponseWriter, lines []string, base64Key, base
 			continue
 		}
 
-		// Insert new key after header
-		if !keyInserted && strings.HasPrefix(trimmed, "#EXT") && !strings.HasPrefix(trimmed, "#EXTM3U") && !strings.HasPrefix(trimmed, "#EXT-X-VERSION") {
-			// Insert before the first tag that isn't the header
-			// Actually, usually keys come before segments. Let's put it after #EXT-X-VERSION or #EXT-X-TARGETDURATION or similar top level tags.
-			// A safe bet is to insert it before the first segment or key-dependent tag.
-			// But simpler: Insert it after the standard headers.
-			// Let's just print it before printing the current line if it's the first non-header tag?
-			// Or just insert it right after #EXTM3U or #EXT-X-VERSION if present.
-			
-			// Better strategy: Print it once we see the first tag that implies content or just after headers.
-			// Let's print it immediately after #EXT-X-VERSION if it exists, or after #EXTM3U if not.
-			// To be safe and simple: We'll just print it at the top of the loop if we haven't yet, but we need to respect the file order.
-			// Wait, the user wants to replace keys.
-			// Let's just insert it before the first segment or map.
-		}
-		
-		// We will insert the key explicitly before the first segment or map, OR if we hit the end of headers.
-		// Let's do this: Iterate, print headers. If we see a segment or map, and haven't printed key, print key.
-		
-		// Rewrite Map URI
-		if strings.HasPrefix(trimmed, "#EXT-X-MAP") {
-			if !keyInserted {
-				printKey(w, base64Key)
+		if experimental {
+			// In experimental mode, we don't insert keys, we decrypt on the fly
+			// Rewrite Map URI
+			if strings.HasPrefix(trimmed, "#EXT-X-MAP") {
+				line = rewriteMapURI(line, baseURL, hexKey, true)
+				fmt.Fprintln(w, line)
+				continue
+			}
+
+			// Rewrite Segment URI
+			if !strings.HasPrefix(trimmed, "#") && len(trimmed) > 0 {
+				absoluteURL := resolveURL(baseURL, trimmed)
+				decryptURL := fmt.Sprintf("/decrypt?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
+				fmt.Fprintln(w, decryptURL)
+				continue
+			}
+		} else {
+			// Standard Proxy Mode logic
+
+			// Insert new key after header
+			if !keyInserted && strings.HasPrefix(trimmed, "#EXT") && !strings.HasPrefix(trimmed, "#EXTM3U") && !strings.HasPrefix(trimmed, "#EXT-X-VERSION") {
+				// We will insert the key explicitly before the first segment or map, OR if we hit the end of headers.
+			}
+
+			// Rewrite Map URI
+			if strings.HasPrefix(trimmed, "#EXT-X-MAP") {
+				if !keyInserted {
+					printKey(w, hexKey)
+					keyInserted = true
+				}
+				line = rewriteMapURI(line, baseURL, "", false)
+			}
+
+			// Rewrite Segment URI
+			if !strings.HasPrefix(trimmed, "#") && len(trimmed) > 0 {
+				if !keyInserted {
+					printKey(w, hexKey)
+					keyInserted = true
+				}
+				absoluteURL := resolveURL(baseURL, trimmed)
+				fmt.Fprintln(w, absoluteURL)
+				continue
+			}
+
+			// Handle Header insertion logic if not triggered by segment
+			if !keyInserted && (strings.HasPrefix(trimmed, "#EXTINF") || strings.HasPrefix(trimmed, "#EXT-X-BYTERANGE")) {
+				printKey(w, hexKey)
 				keyInserted = true
 			}
-			line = rewriteMapURI(line, baseURL)
-		}
-
-		// Rewrite Segment URI
-		if !strings.HasPrefix(trimmed, "#") && len(trimmed) > 0 {
-			if !keyInserted {
-				printKey(w, base64Key)
-				keyInserted = true
-			}
-			absoluteURL := resolveURL(baseURL, trimmed)
-			fmt.Fprintln(w, absoluteURL)
-			continue
-		}
-
-		// Handle Header insertion logic if not triggered by segment
-		if !keyInserted && (strings.HasPrefix(trimmed, "#EXTINF") || strings.HasPrefix(trimmed, "#EXT-X-BYTERANGE")) {
-			printKey(w, base64Key)
-			keyInserted = true
 		}
 
 		fmt.Fprintln(w, line)
 	}
 }
 
-func printKey(w http.ResponseWriter, base64Key string) {
+func printKey(w http.ResponseWriter, hexKey string) {
 	// Using identity format as requested in plan, but user asked for SAMPLE-AES.
 	// User example: #EXT-X-SESSION-KEY:KEYFORMATVERSIONS="1",METHOD=SAMPLE-AES...
 	// User request: "add the hex key as a SAMPLE-AES key line"
-	// I will use KEYFORMAT="identity" usually for raw keys, but if they want SAMPLE-AES with a raw key, 
+	// I will use KEYFORMAT="identity" usually for raw keys, but if they want SAMPLE-AES with a raw key,
 	// standard HLS uses METHOD=SAMPLE-AES,URI="data:..." and usually implicit identity or specified.
 	// I'll stick to the plan: METHOD=SAMPLE-AES,URI="data:...",KEYFORMAT="identity"
-	
+
 	// Note: The user provided example shows KEYFORMAT="urn:uuid:..." and "com.microsoft.playready".
 	// I will replace all that with a single key line.
-	
-	fmt.Fprintf(w, "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"data:text/plain;base64,%s\",KEYFORMAT=\"identity\",KEYFORMATVERSIONS=\"1\"\n", base64Key)
+
+	fmt.Fprintf(w, "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"/key.ts?key=%s\",KEYFORMAT=\"identity\",KEYFORMATVERSIONS=\"1\"\n", hexKey)
 }
 
-func rewriteURIAttribute(line, hexKey, baseURL string) string {
+func rewriteURIAttribute(line, hexKey, baseURL string, experimental bool) string {
 	// Regex or simple string parsing. Simple parsing is faster and sufficient if format is standard.
 	// We look for URI="..."
 	// We need to replace the value inside quotes.
-	
+
 	// Find URI="
 	start := strings.Index(line, "URI=\"")
 	if start == -1 {
@@ -251,14 +265,17 @@ func rewriteURIAttribute(line, hexKey, baseURL string) string {
 
 	originalURI := line[start:end]
 	absoluteURL := resolveURL(baseURL, originalURI)
-	
+
 	// It's a playlist in a master playlist, so we proxy it.
-	proxyURL := fmt.Sprintf("/playlist.m3u8?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
+	proxyURL := fmt.Sprintf("/proxy?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
+	if experimental {
+		proxyURL += "&experimental=true"
+	}
 
 	return line[:start] + proxyURL + line[end:]
 }
 
-func rewriteMapURI(line, baseURL string) string {
+func rewriteMapURI(line, baseURL, hexKey string, experimental bool) string {
 	start := strings.Index(line, "URI=\"")
 	if start == -1 {
 		return line
@@ -274,7 +291,14 @@ func rewriteMapURI(line, baseURL string) string {
 	originalURI := line[start:end]
 	absoluteURL := resolveURL(baseURL, originalURI)
 
-	return line[:start] + absoluteURL + line[end:]
+	var newURI string
+	if experimental {
+		newURI = fmt.Sprintf("/decrypt?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
+	} else {
+		newURI = absoluteURL
+	}
+
+	return line[:start] + newURI + line[end:]
 }
 
 func resolveURL(base, target string) string {
@@ -302,4 +326,56 @@ func parseBandwidth(line string) int {
 	val := rest[:end]
 	bw, _ := strconv.Atoi(strings.TrimSpace(val))
 	return bw
+}
+
+func decryptHandler(w http.ResponseWriter, r *http.Request) {
+	targetURL := r.URL.Query().Get("url")
+	hexKey := r.URL.Query().Get("key")
+
+	if targetURL == "" || hexKey == "" {
+		http.Error(w, "Missing 'url' or 'key' query parameters", http.StatusBadRequest)
+		return
+	}
+
+	// Construct ffmpeg command
+	// ffmpeg -decryption_key <key> -i <url> -c copy -f mp4 -movflags frag_keyframe+empty_moov+default_base_moof pipe:1
+	cmd := exec.Command("ffmpeg",
+		"-decryption_key", hexKey,
+		"-i", targetURL,
+		"-c", "copy",
+		"-f", "mp4",
+		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"pipe:1",
+	)
+
+	// Set output to response writer
+	cmd.Stdout = w
+	// Capture stderr for debugging
+	cmd.Stderr = os.Stderr
+
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if err := cmd.Run(); err != nil {
+		log.Printf("FFmpeg failed: %v", err)
+		// Note: If we already started writing to w, this error might not be visible to client as HTTP error
+	}
+}
+
+func keyHandler(w http.ResponseWriter, r *http.Request) {
+	hexKey := r.URL.Query().Get("key")
+	if hexKey == "" {
+		http.Error(w, "Missing 'key' query parameter", http.StatusBadRequest)
+		return
+	}
+
+	keyBytes, err := hex.DecodeString(hexKey)
+	if err != nil {
+		http.Error(w, "Invalid hex key", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Write(keyBytes)
 }
