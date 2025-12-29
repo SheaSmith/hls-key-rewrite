@@ -157,7 +157,7 @@ func processMasterPlaylist(w http.ResponseWriter, lines []string, hexKey, baseUR
 	if bestVariant != "" {
 		fmt.Fprintln(w, bestVariant)
 		absoluteURL := resolveURL(baseURL, bestVariantURI)
-		proxyURL := fmt.Sprintf("/proxy?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
+		proxyURL := fmt.Sprintf("/playlist.m3u8?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
 		if experimental {
 			proxyURL += "&experimental=true"
 		}
@@ -267,7 +267,7 @@ func rewriteURIAttribute(line, hexKey, baseURL string, experimental bool) string
 	absoluteURL := resolveURL(baseURL, originalURI)
 
 	// It's a playlist in a master playlist, so we proxy it.
-	proxyURL := fmt.Sprintf("/proxy?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
+	proxyURL := fmt.Sprintf("/playlist.m3u8?url=%s&key=%s", url.QueryEscape(absoluteURL), hexKey)
 	if experimental {
 		proxyURL += "&experimental=true"
 	}
