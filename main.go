@@ -302,12 +302,12 @@ func streamM3UHandler(w http.ResponseWriter, r *http.Request) {
 func generateFFmpegCommand(s Stream, host string) string {
 	videoURL := s.VideoURL
 	if s.VideoKey != "" {
-		videoURL = fmt.Sprintf("http://%s/playlist.m3u8?url=%s&key=%s&experimental=true", host, url.QueryEscape(s.VideoURL), s.VideoKey)
+		videoURL = fmt.Sprintf("https://%s/playlist.m3u8?url=%s&key=%s&experimental=true", host, url.QueryEscape(s.VideoURL), s.VideoKey)
 	}
 
 	audioURL := s.AudioURL
 	if s.AudioKey != "" {
-		audioURL = fmt.Sprintf("http://%s/playlist.m3u8?url=%s&key=%s&experimental=true", host, url.QueryEscape(s.AudioURL), s.AudioKey)
+		audioURL = fmt.Sprintf("https://%s/playlist.m3u8?url=%s&key=%s&experimental=true", host, url.QueryEscape(s.AudioURL), s.AudioKey)
 	}
 
 	delay := s.AudioDelay
