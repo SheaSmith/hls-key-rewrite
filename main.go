@@ -330,7 +330,7 @@ func tvheadendPlaylistHandler(w http.ResponseWriter, r *http.Request) {
 
 	for _, s := range streams {
 		fmt.Fprintf(w, "#EXTINF:-1, %s\n", s.Name)
-		fmt.Fprintf(w, "http://%s/stream/%s.m3u\n", host, s.ID)
+		fmt.Fprintf(w, "https://%s/stream/%s.m3u\n", host, s.ID)
 	}
 }
 
