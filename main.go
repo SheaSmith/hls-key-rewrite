@@ -4,18 +4,61 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
-
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 )
 
+type Config struct {
+	Delay string `json:"delay"`
+}
+
+var (
+	config      Config
+	configMutex sync.RWMutex
+	configFile  = "config.json"
+)
+
+func loadConfig() {
+	configMutex.Lock()
+	defer configMutex.Unlock()
+
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		log.Printf("Could not read config file, using default delay 2.3")
+		config.Delay = "2.3"
+		return
+	}
+
+	if err := json.Unmarshal(data, &config); err != nil {
+		log.Printf("Could not parse config file, using default delay 2.3")
+		config.Delay = "2.3"
+		return
+	}
+}
+
+func saveConfig() error {
+	configMutex.RLock()
+	defer configMutex.RUnlock()
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(configFile, data, 0644)
+}
+
 func main() {
+	loadConfig()
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -25,6 +68,7 @@ func main() {
 	http.HandleFunc("/decrypt", decryptHandler)
 	http.HandleFunc("/key.ts", keyHandler)
 	http.HandleFunc("/ffmpeg", ffmpegHandler)
+	http.HandleFunc("/settings", settingsHandler)
 	http.HandleFunc("/", uiHandler)
 
 	log.Printf("Starting HLS Proxy on :%s", port)
@@ -385,22 +429,40 @@ func keyHandler(w http.ResponseWriter, r *http.Request) {
 func ffmpegHandler(w http.ResponseWriter, r *http.Request) {
 	v := r.URL.Query().Get("v")
 	a := r.URL.Query().Get("a")
-	delay := r.URL.Query().Get("delay")
 
 	if v == "" || a == "" {
 		http.Error(w, "Missing 'v' (video) or 'a' (audio) query parameters", http.StatusBadRequest)
 		return
 	}
 
-	if delay == "" {
-		delay = "2.3"
-	}
+	configMutex.RLock()
+	delay := config.Delay
+	configMutex.RUnlock()
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	script := fmt.Sprintf("#!/bin/sh\nexec ffmpeg \\\n-i \"%s\" \\\n-itsoffset %s -i \"%s\" \\\n-map 0:v \\\n-map 1:a \\\n-c copy \\\n-f mpegts -", v, delay, a)
+	// Optimized for faster startup: -fflags +nobuffer -probesize 32 -analyzeduration 0
+	script := fmt.Sprintf("#!/bin/sh\nexec ffmpeg \\\n-fflags +nobuffer -probesize 32 -analyzeduration 0 \\\n-i \"%s\" \\\n-itsoffset %s -i \"%s\" \\\n-map 0:v \\\n-map 1:a \\\n-c copy \\\n-f mpegts -", v, delay, a)
 	fmt.Fprint(w, script)
+}
+
+func settingsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		delay := r.FormValue("delay")
+		if delay != "" {
+			configMutex.Lock()
+			config.Delay = delay
+			configMutex.Unlock()
+			if err := saveConfig(); err != nil {
+				http.Error(w, "Failed to save config", http.StatusInternalServerError)
+				return
+			}
+		}
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
 func uiHandler(w http.ResponseWriter, r *http.Request) {
@@ -408,54 +470,72 @@ func uiHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+
+	configMutex.RLock()
+	currentDelay := config.Delay
+	configMutex.RUnlock()
+
 	html := `<!DOCTYPE html>
 <html>
 <head>
     <title>FFmpeg Stream Mixer</title>
     <style>
         body { font-family: sans-serif; max-width: 800px; margin: 20px auto; padding: 20px; }
+        .section { margin-bottom: 30px; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }
         .field { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; }
         input[type="text"], input[type="number"] { width: 100%; padding: 8px; box-sizing: border-box; }
         .result { margin-top: 20px; padding: 15px; background: #f0f0f0; border: 1px solid #ccc; word-break: break-all; }
         button { padding: 10px 20px; background: #007bff; color: white; border: none; cursor: pointer; }
         button:hover { background: #0056b3; }
+        h2 { margin-top: 0; }
     </style>
 </head>
 <body>
     <h1>FFmpeg Stream Mixer</h1>
-    <div class="field">
-        <label for="videoUrl">Video URL (m3u8):</label>
-        <input type="text" id="videoUrl" placeholder="https://example.com/video.m3u8">
+    
+    <div class="section">
+        <h2>Global Settings</h2>
+        <form action="/settings" method="POST">
+            <div class="field">
+                <label for="globalDelay">Global Audio Delay (seconds):</label>
+                <input type="number" id="globalDelay" name="delay" step="0.1" value="` + currentDelay + `">
+            </div>
+            <button type="submit">Save Delay</button>
+        </form>
     </div>
-    <div class="field">
-        <label for="audioUrl">Audio URL (aac/m3u8):</label>
-        <input type="text" id="audioUrl" placeholder="https://example.com/audio.aac">
-    </div>
-    <div class="field">
-        <label for="delay">Audio Delay (seconds):</label>
-        <input type="number" id="delay" step="0.1" value="2.3">
-    </div>
-    <button onclick="generateLink()">Generate Stream Link</button>
 
-    <div id="resultContainer" style="display:none;">
-        <h3>Stream URL:</h3>
-        <div class="result" id="streamUrl"></div>
-        <p><small>Open this URL in VLC or any player that supports MPEG-TS over HTTP.</small></p>
+    <div class="section">
+        <h2>Generate Stream Link</h2>
+        <div class="field">
+            <label for="videoUrl">Video URL (m3u8):</label>
+            <input type="text" id="videoUrl" placeholder="https://example.com/video.m3u8">
+        </div>
+        <div class="field">
+            <label for="audioUrl">Audio URL (aac/m3u8):</label>
+            <input type="text" id="audioUrl" placeholder="https://example.com/audio.aac">
+        </div>
+        <button onclick="generateLink()">Generate Stream Link</button>
+
+        <div id="resultContainer" style="display:none;">
+            <h3>Stream URL:</h3>
+            <div class="result" id="streamUrl"></div>
+            <p><small>Open this URL in VLC or any player that supports MPEG-TS over HTTP.</small></p>
+            <p><small>Note: Delay is now persisted globally on the server.</small></p>
+        </div>
     </div>
 
     <script>
         function generateLink() {
             const v = encodeURIComponent(document.getElementById('videoUrl').value);
             const a = encodeURIComponent(document.getElementById('audioUrl').value);
-            const delay = encodeURIComponent(document.getElementById('delay').value);
             
             if (!v || !a) {
                 alert('Please provide both video and audio URLs');
                 return;
             }
 
-            const streamUrl = window.location.origin + '/ffmpeg?v=' + v + '&a=' + a + '&delay=' + delay;
+            const streamUrl = window.location.origin + '/ffmpeg?v=' + v + '&a=' + a;
             document.getElementById('streamUrl').innerText = streamUrl;
             document.getElementById('resultContainer').style.display = 'block';
         }
