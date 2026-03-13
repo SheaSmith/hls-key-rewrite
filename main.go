@@ -4,38 +4,18 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
+
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
-)
-
-type Stream struct {
-	ID         string  `json:"id"`
-	Name       string  `json:"name"`
-	VideoURL   string  `json:"video_url"`
-	VideoKey   string  `json:"video_key,omitempty"`
-	AudioURL   string  `json:"audio_url"`
-	AudioKey   string  `json:"audio_key,omitempty"`
-	AudioDelay float64 `json:"audio_delay"` // in seconds
-}
-
-var (
-	streams     = make(map[string]Stream)
-	streamsLock sync.RWMutex
-	streamsFile = "streams.json"
 )
 
 func main() {
-	loadStreams()
-
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -44,293 +24,12 @@ func main() {
 	http.HandleFunc("/playlist.m3u8", proxyHandler)
 	http.HandleFunc("/decrypt", decryptHandler)
 	http.HandleFunc("/key.ts", keyHandler)
-
-	// New system endpoints
-	http.HandleFunc("/admin", adminHandler)
-	http.HandleFunc("/api/streams", apiStreamsHandler)
-	http.HandleFunc("/tvheadend.m3u8", tvheadendPlaylistHandler)
-	http.HandleFunc("/stream/", streamM3UHandler)
+	http.HandleFunc("/ffmpeg", ffmpegHandler)
+	http.HandleFunc("/", uiHandler)
 
 	log.Printf("Starting HLS Proxy on :%s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatalf("Server failed: %v", err)
-	}
-}
-
-func loadStreams() {
-	file, err := os.ReadFile(streamsFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return
-		}
-		log.Printf("Failed to read streams file: %v", err)
-		return
-	}
-	streamsLock.Lock()
-	defer streamsLock.Unlock()
-	if err := json.Unmarshal(file, &streams); err != nil {
-		log.Printf("Failed to unmarshal streams: %v", err)
-	}
-}
-
-func saveStreams() {
-	streamsLock.RLock()
-	defer streamsLock.RUnlock()
-	data, err := json.MarshalIndent(streams, "", "  ")
-	if err != nil {
-		log.Printf("Failed to marshal streams: %v", err)
-		return
-	}
-	if err := os.WriteFile(streamsFile, data, 0644); err != nil {
-		log.Printf("Failed to save streams: %v", err)
-	}
-}
-
-func adminHandler(w http.ResponseWriter, r *http.Request) {
-	const adminHTML = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Stream Manager</title>
-    <style>
-        body { font-family: sans-serif; margin: 20px; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
-        input[type="text"], input[type="number"] { width: 100%; box-sizing: border-box; }
-        .actions { white-space: nowrap; }
-        .export-import { margin-top: 20px; border-top: 1px solid #ccc; padding-top: 10px; }
-    </style>
-</head>
-<body>
-    <h1>Stream Manager</h1>
-    <div id="app">
-        <table>
-            <thead>
-                <tr>
-                    <th>Name</th>
-                    <th>Video URL</th>
-                    <th>Video Key (Hex)</th>
-                    <th>Audio URL (HLS/AAC)</th>
-                    <th>Audio Key (Hex)</th>
-                    <th>Delay (sec)</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody id="stream-list"></tbody>
-            <tfoot>
-                <tr>
-                    <td><input type="text" id="new-name" placeholder="Name"></td>
-                    <td><input type="text" id="new-video-url" placeholder="Video URL"></td>
-                    <td><input type="text" id="new-video-key" placeholder="Hex Key"></td>
-                    <td><input type="text" id="new-audio-url" placeholder="Audio URL"></td>
-                    <td><input type="text" id="new-audio-key" placeholder="Hex Key"></td>
-                    <td><input type="number" id="new-delay" value="0" step="0.1"></td>
-                    <td><button onclick="addStream()">Add</button></td>
-                </tr>
-            </tfoot>
-        </table>
-
-        <div class="export-import">
-            <h3>Import/Export</h3>
-            <button onclick="exportStreams()">Export JSON</button>
-            <input type="file" id="import-file" accept=".json" onchange="importStreams(event)">
-        </div>
-    </div>
-
-    <script>
-        async function loadStreams() {
-            const resp = await fetch('/api/streams');
-            const streams = await resp.json();
-            const list = document.getElementById('stream-list');
-            list.innerHTML = '';
-            Object.values(streams).forEach(s => {
-                const tr = document.createElement('tr');
-                tr.innerHTML = ` + "`" + `
-                    <td><input type="text" value="${s.name}" onchange="updateStream('${s.id}', 'name', this.value)"></td>
-                    <td><input type="text" value="${s.video_url}" onchange="updateStream('${s.id}', 'video_url', this.value)"></td>
-                    <td><input type="text" value="${s.video_key || ''}" onchange="updateStream('${s.id}', 'video_key', this.value)"></td>
-                    <td><input type="text" value="${s.audio_url}" onchange="updateStream('${s.id}', 'audio_url', this.value)"></td>
-                    <td><input type="text" value="${s.audio_key || ''}" onchange="updateStream('${s.id}', 'audio_key', this.value)"></td>
-                    <td><input type="number" value="${s.audio_delay}" step="0.1" onchange="updateStream('${s.id}', 'audio_delay', parseFloat(this.value))"></td>
-                    <td class="actions">
-                        <button onclick="deleteStream('${s.id}')">Delete</button>
-                        <a href="/playlist.m3u8?url=${encodeURIComponent(s.video_url)}&key=${s.video_key || ''}" target="_blank">Video</a>
-                        <a href="/playlist.m3u8?url=${encodeURIComponent(s.audio_url)}&key=${s.audio_key || ''}" target="_blank">Audio</a>
-                    </td>
-                ` + "`" + `;
-                list.appendChild(tr);
-            });
-        }
-
-        async function addStream() {
-            const stream = {
-                name: document.getElementById('new-name').value,
-                video_url: document.getElementById('new-video-url').value,
-                video_key: document.getElementById('new-video-key').value,
-                audio_url: document.getElementById('new-audio-url').value,
-                audio_key: document.getElementById('new-audio-key').value,
-                audio_delay: parseFloat(document.getElementById('new-delay').value)
-            };
-            await fetch('/api/streams', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(stream)
-            });
-            loadStreams();
-        }
-
-        async function updateStream(id, field, value) {
-            const resp = await fetch('/api/streams');
-            const streams = await resp.json();
-            const stream = streams[id];
-            stream[field] = value;
-            await fetch('/api/streams', {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(stream)
-            });
-        }
-
-        async function deleteStream(id) {
-            if (confirm('Delete stream?')) {
-                await fetch('/api/streams?id=' + id, { method: 'DELETE' });
-                loadStreams();
-            }
-        }
-
-        function exportStreams() {
-            fetch('/api/streams')
-                .then(resp => resp.json())
-                .then(streams => {
-                    const blob = new Blob([JSON.stringify(streams, null, 2)], { type: 'application/json' });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = 'streams.json';
-                    a.click();
-                });
-        }
-
-        function importStreams(event) {
-            const file = event.target.files[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onload = async (e) => {
-                const streams = JSON.parse(e.target.result);
-                await fetch('/api/streams', {
-                    method: 'IMPORT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(streams)
-                });
-                loadStreams();
-            };
-            reader.readAsText(file);
-        }
-
-        loadStreams();
-    </script>
-</body>
-</html>
-`
-	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(adminHTML))
-}
-
-func apiStreamsHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "GET":
-		streamsLock.RLock()
-		defer streamsLock.RUnlock()
-		json.NewEncoder(w).Encode(streams)
-	case "POST", "PUT":
-		var s Stream
-		if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if s.ID == "" {
-			s.ID = fmt.Sprintf("%d", time.Now().UnixNano())
-		}
-		streamsLock.Lock()
-		streams[s.ID] = s
-		streamsLock.Unlock()
-		saveStreams()
-		w.WriteHeader(http.StatusOK)
-	case "DELETE":
-		id := r.URL.Query().Get("id")
-		streamsLock.Lock()
-		delete(streams, id)
-		streamsLock.Unlock()
-		saveStreams()
-		w.WriteHeader(http.StatusOK)
-	case "IMPORT":
-		var imported map[string]Stream
-		if err := json.NewDecoder(r.Body).Decode(&imported); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		streamsLock.Lock()
-		for k, v := range imported {
-			streams[k] = v
-		}
-		streamsLock.Unlock()
-		saveStreams()
-		w.WriteHeader(http.StatusOK)
-	}
-}
-
-func streamM3UHandler(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/stream/")
-	id = strings.TrimSuffix(id, ".m3u8")
-	id = strings.TrimSuffix(id, ".m3u")
-
-	streamsLock.RLock()
-	s, ok := streams[id]
-	streamsLock.RUnlock()
-
-	if !ok {
-		http.Error(w, "Stream not found", http.StatusNotFound)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/x-mpegurl")
-	fmt.Fprintln(w, "#EXTM3U")
-	fmt.Fprintf(w, "#EXTINF:-1, %s\n", s.Name)
-	fmt.Fprintf(w, "pipe://%s\n", generateFFmpegCommand(s, r.Host))
-}
-
-func generateFFmpegCommand(s Stream, host string) string {
-	videoURL := s.VideoURL
-	if s.VideoKey != "" {
-		videoURL = fmt.Sprintf("https://%s/playlist.m3u8?url=%s&key=%s&experimental=true", host, url.QueryEscape(s.VideoURL), s.VideoKey)
-	}
-
-	audioURL := s.AudioURL
-	if s.AudioKey != "" {
-		audioURL = fmt.Sprintf("https://%s/playlist.m3u8?url=%s&key=%s&experimental=true", host, url.QueryEscape(s.AudioURL), s.AudioKey)
-	}
-
-	delay := s.AudioDelay
-
-	// TVHeadend prefers mpegts for pipes.
-	// Re-encoding audio to AAC ensures it plays back nicely with TVHeadend and handles delay correctly.
-	return fmt.Sprintf("ffmpeg -i \"%s\" -itsoffset %f -i \"%s\" -map 0:v -map 1:a -c:v copy -c:a aac -f mpegts pipe:1", videoURL, delay, audioURL)
-}
-
-func tvheadendPlaylistHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/x-mpegurl")
-	fmt.Fprintln(w, "#EXTM3U")
-	streamsLock.RLock()
-	defer streamsLock.RUnlock()
-
-	host := r.Host
-	if host == "" {
-		host = "localhost:8080"
-	}
-
-	for _, s := range streams {
-		fmt.Fprintf(w, "#EXTINF:-1, %s\n", s.Name)
-		fmt.Fprintf(w, "https://%s/stream/%s.m3u\n", host, s.ID)
 	}
 }
 
@@ -681,4 +380,88 @@ func keyHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Write(keyBytes)
+}
+
+func ffmpegHandler(w http.ResponseWriter, r *http.Request) {
+	v := r.URL.Query().Get("v")
+	a := r.URL.Query().Get("a")
+	delay := r.URL.Query().Get("delay")
+
+	if v == "" || a == "" {
+		http.Error(w, "Missing 'v' (video) or 'a' (audio) query parameters", http.StatusBadRequest)
+		return
+	}
+
+	if delay == "" {
+		delay = "2.3"
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	script := fmt.Sprintf("#!/bin/sh\nexec ffmpeg \\\n-i \"%s\" \\\n-itsoffset %s -i \"%s\" \\\n-map 0:v \\\n-map 1:a \\\n-c copy \\\n-f mpegts -", v, delay, a)
+	fmt.Fprint(w, script)
+}
+
+func uiHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	html := `<!DOCTYPE html>
+<html>
+<head>
+    <title>FFmpeg Stream Mixer</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 20px auto; padding: 20px; }
+        .field { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input[type="text"], input[type="number"] { width: 100%; padding: 8px; box-sizing: border-box; }
+        .result { margin-top: 20px; padding: 15px; background: #f0f0f0; border: 1px solid #ccc; word-break: break-all; }
+        button { padding: 10px 20px; background: #007bff; color: white; border: none; cursor: pointer; }
+        button:hover { background: #0056b3; }
+    </style>
+</head>
+<body>
+    <h1>FFmpeg Stream Mixer</h1>
+    <div class="field">
+        <label for="videoUrl">Video URL (m3u8):</label>
+        <input type="text" id="videoUrl" placeholder="https://example.com/video.m3u8">
+    </div>
+    <div class="field">
+        <label for="audioUrl">Audio URL (aac/m3u8):</label>
+        <input type="text" id="audioUrl" placeholder="https://example.com/audio.aac">
+    </div>
+    <div class="field">
+        <label for="delay">Audio Delay (seconds):</label>
+        <input type="number" id="delay" step="0.1" value="2.3">
+    </div>
+    <button onclick="generateLink()">Generate Stream Link</button>
+
+    <div id="resultContainer" style="display:none;">
+        <h3>Stream URL:</h3>
+        <div class="result" id="streamUrl"></div>
+        <p><small>Open this URL in VLC or any player that supports MPEG-TS over HTTP.</small></p>
+    </div>
+
+    <script>
+        function generateLink() {
+            const v = encodeURIComponent(document.getElementById('videoUrl').value);
+            const a = encodeURIComponent(document.getElementById('audioUrl').value);
+            const delay = encodeURIComponent(document.getElementById('delay').value);
+            
+            if (!v || !a) {
+                alert('Please provide both video and audio URLs');
+                return;
+            }
+
+            const streamUrl = window.location.origin + '/ffmpeg?v=' + v + '&a=' + a + '&delay=' + delay;
+            document.getElementById('streamUrl').innerText = streamUrl;
+            document.getElementById('resultContainer').style.display = 'block';
+        }
+    </script>
+</body>
+</html>`
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprint(w, html)
 }
