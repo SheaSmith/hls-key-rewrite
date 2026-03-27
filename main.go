@@ -443,7 +443,7 @@ func ffmpegHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	// Optimized for faster startup: -fflags +nobuffer -probesize 32 -analyzeduration 0
-	script := fmt.Sprintf("#!/bin/sh\nexec ffmpeg \\\n-fflags +nobuffer -loglevel fatal -probesize 10M -analyzeduration 0 -fpsprobesize 0 -thread_queue_size 1024 \\\n-i \"%s\" -itsoffset %s \\\n-thread_queue_size 1024 -i \"%s\" \\\n-map 0:v \\\n-map 1:a \\\n-c copy \\\n-f mpegts -", v, delay, a)
+	script := fmt.Sprintf("#!/bin/sh\nexec ffmpeg \\\n-fflags +nobuffer -loglevel fatal -probesize 10M -analyzeduration 0 -fpsprobesize 0 -thread_queue_size 1024 \\\n-i \"%s\" -itsoffset %s \\\n-thread_queue_size 1024 -i \"%s\" \\\n-map 0:v \\\n-map 1:a \\\n-c copy \\\n-f mpegts -", a, delay, v)
 	fmt.Fprint(w, script)
 }
 
